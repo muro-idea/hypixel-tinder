@@ -1,4 +1,4 @@
-// const https = require('https');
+const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const { Server } = require('socket.io');
@@ -12,8 +12,8 @@ const options = {
 
 };
 
-// const server = https.createServer(options);
-const server = http.createServer();
+const server = https.createServer(options);
+// const server = http.createServer();
 const io = new Server(server, {
   cors: {
     origin: "http://localhost:3000",
