@@ -16,7 +16,10 @@ model User {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   emailVerified DateTime? @map("email_verified")
-  Actions Action[]
+
+  actions Action[] @relation(name: "primary")
+  targets Action[] @relation(name: "secondary")
+
   Chats   Chat[]
   Matches Match[]
   Message Message[]
@@ -60,13 +63,14 @@ model Session {
 
 model Action {
   id        String   @id @default(cuid())
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User     @relation(name: "primary", fields: [userId], references: [id], onDelete: Cascade)
   userId    String
-  uid       String
+  target    User     @relation(name: "secondary", fields: [targetId], references: [id], onDelete: Cascade)
+  targetId  String
   type      String   @default("skip")
   createdAt DateTime @default(now())
 
-  @@unique([userId, uid])
+  @@unique([userId, targetId])
   @@index([userId])
 }
 

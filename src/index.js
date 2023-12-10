@@ -1,95 +1,56 @@
-const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const { Server } = require('socket.io');
 const { PrismaClient } = require('@prisma/client');
+
 const prisma = new PrismaClient();
 
-const options = {
-  key: fs.readFileSync('./src/ssl/private.key'),
-  cert: fs.readFileSync('./src/ssl/certificate.crt'),
-  ca: fs.readFileSync('./src/ssl/ca_bundle.crt'),
+// const options = {
+//   key: fs.readFileSync('./src/ssl/private.key'),
+//   cert: fs.readFileSync('./src/ssl/certificate.crt'),
+//   ca: fs.readFileSync('./src/ssl/ca_bundle.crt'),
+// };
 
-};
+const server = http.createServer();
 
-const server = https.createServer(options);
-// const server = http.createServer();
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000",
-    methods: ["GET", "POST"],
-    allowedHeaders: ["my-custom-header"],
-    credentials: true
-  }
+    origin: '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Authorization'],
+    credentials: true,
+  },
 });
 
-const presenceMap = {};
-
 io.on('connection', (socket) => {
-  console.log('A client connected to the chat namespace');
+  const handler = new MessageHandler(socket, true);
 
-  socket.on('setUserId', (userId) => {
-    socket.userId = userId;
-    console.log(`Client with id ${userId} connected`);
+  console.log('New connection:', socket.handshake.headers.authorization);
+  if (!socket.handshake.headers.authorization) {
+    handler.error('Missing authorization header');
+    return;
+  }
+
+  socket.userId = socket.handshake.headers.authorization;
+  socket.join(`user_${socket.userId}`);
+  socket.join('global_notifications')
+
+  socket.on('joinRoom', (roomId) => {
+    handler.setRoomId(roomId);
+    handler.join(roomId);
   });
 
-  socket.on('joinRoom', async (chatId) => {
-    if (!socket.userId || socket.userId === 'undefined') {
-      socket.emit('error', 'Missing userId');
-      console.log('Missing userId');
-      return;
-    }
-  
-    if (!chatId) {
-      socket.emit('error', 'Missing chatId');
-      console.log('Missing chatId');
-      return;
-    }
-  
-    const chat = await prisma.chat.findUnique({
-      where: {
-        id: chatId
-      },
-      select: {
-        members: true
-      }
-    });
-  
-    if (!chat || !chat.members) {
-      socket.emit('error', 'Room not found');
-      console.log('Room not found');
-      return;
-    }
-  
-    if (!chat.members.find((user) => user.id === socket.userId)) {
-      socket.emit('error', 'User not found');
-      console.log('User not found');
-      return;
-    }
-  
-    if (!presenceMap[chatId]) {
-      presenceMap[chatId] = [];
-    }
-    presenceMap[chatId].push(socket.id);
-  
-    // Emit presence information to the socket user itself
-    socket.emit('presenceJoin', JSON.stringify(presenceMap[chatId]));
-  
-    // Emit presence information to other users in the chat room
-    socket.to(chatId).emit('presenceJoin', presenceMap[chatId]);
-  
-    console.log(`Client joined room: ${chatId}`);
+  socket.on('leaveRoom', (roomId) => {
+    handler.leave(roomId);
   });
-  
-  socket.on('leaveRoom', (chatId) => {
-    socket.leave(chatId);
-  
-    if (presenceMap[chatId]) {
-      presenceMap[chatId] = presenceMap[chatId].filter(id => id !== socket.id);
-      socket.to(chatId).emit('presenceLeave', presenceMap[chatId]);
-    }
-  
-    console.log(`Client left room: ${chatId}`);
+
+  socket.on('typing', (roomId) => {
+    handler.setTyping(true);
+  });
+
+  socket.on('stopTyping', (roomId) => {
+    handler.setTyping(false);
+
   });
 
   socket.on('deleteMessage', async (messageId) => {
@@ -97,37 +58,33 @@ io.on('connection', (socket) => {
       const message = await prisma.message.findUnique({
         where: {
           id: messageId,
-          senderId: socket.userId
         },
         select: {
           sender: true,
-          chat: true
-        }
+          chat: true,
+        },
       });
 
       if (!message) {
-        socket.emit('error', 'Message not found');
-        console.log('Message not found');
+        handler.error('The message you are trying to delete does not exist');
         return;
       }
 
       if (message.sender.id !== socket.userId) {
-        socket.emit('error', 'You are not allowed to delete this message');
-        console.log('You are not allowed to delete this message');
+        handler.error('You are not allowed to delete this message');
         return;
       }
 
       await prisma.message.delete({
         where: {
-          id: messageId
-        }
+          id: messageId,
+        },
       });
 
-      socket.broadcast.to(message.chat.id).emit('removeMessage', messageId);
-      socket.emit('removeMessage', messageId);
+      handler.broadcastToRoom(message.chat.id, 'removeMessage', messageId);
+      handler.deleteMessage(messageId);
     } catch (error) {
-      console.error('Error deleting message:', error);
-      socket.emit('error', 'Error deleting message');
+      handler.error('Error deleting message');
     }
   });
 
@@ -137,22 +94,21 @@ io.on('connection', (socket) => {
       const { chatId } = data;
 
       if (!chatId) {
-        socket.emit('error', 'Missing chatId');
-        console.log('Missing chatId');
+        handler.error('Missing chatId');
         return;
       }
 
       if (!socket.rooms.has(chatId)) {
-        socket.emit('error', 'You are not allowed in this room');
-        console.log('You are not in this room');
+        handler.error('You are not allowed to send messages to this room');
         return;
       }
 
       if (!socket.userId || socket.userId === 'undefined') {
-        socket.emit('error', 'Missing userId');
-        console.log('Missing userId');
+        handler.error('Missing userId');
         return;
       }
+
+      handler.resetIdleTimer();
 
       try {
         const message = await prisma.message.create({
@@ -184,22 +140,180 @@ io.on('connection', (socket) => {
           }
         });
 
-        socket.broadcast.to(chatId).emit('message', JSON.stringify(message));
-        socket.emit('message', JSON.stringify(message));
+        handler.broadcastToRoom(chatId, 'message', JSON.stringify(message));
+        handler.send(JSON.stringify(message));
       } catch (error) {
         console.error('Error creating message:', error);
-        socket.emit('error', 'Error creating message');
+        handler.error('Error creating message');
       }
     } catch (error) {
       console.error('Error parsing message:', error);
+      handler.error('Error parsing message');
     }
   });
 
+  socket.on('newMatch', (unparsedMatchData) => {
+    try {
+      const matchData = JSON.parse(unparsedMatchData);
+      const { data, user } = matchData;
+
+      if (!data) {
+        handler.error('An error occurred while parsing the match data');
+        return;
+      }
+
+      if (!user) {
+        handler.error('An error occurred while parsing the match data');
+        return;
+      }
+
+      console.log('New match:', data);
+      handler.broadcastToRoom(`user_${data.match.targetId}`, 'newMatch', JSON.stringify({ chatId: data.chat.id, user }));
+    } catch (error) {
+      console.error('Error parsing match data:', error);
+      handler.error('Error parsing match data');
+    }
+  })
+
   socket.on('disconnect', () => {
-    console.log('A client disconnected from the chat namespace');
-  });
+    handler.disconnectClient();
+  })
 });
 
 server.listen(8080, () => {
   console.log(`WebSocket server is running on port ${server.address().port}`);
 });
+
+const MAX_IDLE_TIME = 300000;
+
+class MessageHandler {
+  constructor(socket, devMode = false) {
+    this.socket = socket;
+    this.devMode = devMode;
+    this.roomId = null;
+    this.status = 'online';
+    this.isTyping = false;
+    this.startIdleTimer();
+  }
+
+  setRoomId(roomId) {
+    this.roomId = roomId;
+  }
+
+  startIdleTimer() {
+    this.idleTimer = setTimeout(() => {
+      this.updateStatus('idle');
+    }, MAX_IDLE_TIME);
+  }
+
+  setTyping(isTyping) {
+    if (!this.socket.userId || !this.roomId) return;
+    if (this.isTyping !== isTyping) {
+      this.isTyping = isTyping;
+      if (this.status === 'idle') this.updateStatus('online');
+      if (isTyping) {
+        this.broadcastToRoom(this.roomId, 'typing', this.socket.userId);
+      } else {
+        this.broadcastToRoom(this.roomId, 'stopTyping', this.socket.userId);
+        this.startIdleTimer();
+      }
+    }
+  }
+
+  updateStatus(status) {
+    if (!this.socket.userId) return;
+    if (!this.socket.rooms.has(this.roomId)) return;
+
+    if (this.status !== status) {
+      this.status = status;
+      this.broadcastToRoom(this.roomId, 'updateStatus', JSON.stringify({ id: this.socket.userId, status }));
+      this.broadcastToSelf('updateStatus', JSON.stringify({ id: this.socket.userId, status }));
+      if (this.devMode) console.log({ success: true, type: 'updateStatus', userId: this.socket.userId, status });
+    }
+  }
+
+  resetIdleTimer() {
+    if (!this.socket.userId || !this.roomId) return;
+    clearTimeout(this.idleTimer);
+    if (this.status !== 'online') {
+      this.updateStatus('online');
+    }
+    this.startIdleTimer();
+  }
+
+  disconnectClient() {
+    if (!this.socket.userId || !this.roomId) return;
+    this.broadcastToRoom(this.roomId, 'removePresence', this.socket.userId);
+    if (this.devMode) console.log({ success: true, type: 'disconnect', userId: this.socket.userId });
+    this.socket.disconnect();
+  }
+
+  join(roomId) {
+    this.setRoomId(roomId);
+    this.socket.join(roomId);
+    this.broadcastToRoom(roomId, 'newPresence', JSON.stringify({ id: this.socket.userId, status: 'online' }));
+    this.broadcastToSelf('existingPresences', JSON.stringify(this.getUsersInRoom(roomId).map((userId) => ({ id: userId, status: 'online'  }))));
+    this.startIdleTimer();
+    if (this.devMode) console.log({ success: true, roomId, type: 'join', userId: this.socket.userId });
+  }
+
+  leave(roomId) {
+    this.socket.leave(roomId);
+    this.broadcastToRoom(roomId, 'removePresence', this.socket.userId);
+    if (this.devMode) console.log({ success: true, roomId, type: 'leave', userId: this.socket.userId });
+  }
+
+  send(message) {
+    this.socket.emit('message', message);
+    this.startIdleTimer();
+    if (this.devMode) console.log({ success: true, message });
+  }
+
+  broadcast(message) {
+    this.socket.broadcast.emit('message', message);
+    if (this.devMode) console.log({ success: true, message });
+  }
+
+  broadcastToRoom(roomId, type, message) {
+    this.socket.broadcast.to(roomId).emit(type, message);
+    if (this.devMode) console.log({ success: true, chat: roomId, type, message });
+  }
+
+  broadcastToSelf(type, message) {
+    this.socket.emit(type, message);
+    if (this.devMode) console.log({ success: true, type, message });
+  }
+
+  broadcastToUser(userId, type, message) {
+    this.socket.broadcast.to(userId).emit(type, message);
+    if (this.devMode) console.log({ success: true, user: userId, type, message });
+  }
+
+  error(message) {
+    this.socket.emit('error', message);
+    if (this.devMode) console.log({ success: true, message });
+  }
+
+  deleteMessage(messageId) {
+    this.socket.emit('removeMessage', messageId);
+    if (this.devMode) console.log({ success: true, messageId });
+  }
+
+  getUsersInRoom(roomId) {
+    const socketIds = Array.from(this.socket.adapter.rooms.get(roomId));
+    
+    const uniqueUserIds = new Set();
+
+    const users = socketIds.map((socketId) => {
+      const socket = this.socket.adapter.nsp.sockets.get(socketId);
+      const userId = socket.userId;
+      if (!uniqueUserIds.has(userId)) {
+        uniqueUserIds.add(userId);
+        return userId;
+      }
+      return null;
+    }).filter(userId => userId !== null);
+
+    return users;
+  }
+}
